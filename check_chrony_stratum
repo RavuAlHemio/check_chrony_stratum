@@ -300,6 +300,10 @@ def run():
     args = parser.parse_args()
 
     response = query_chrony(args.hostname, args.port)
+    if response.version != CHRONY_PROTOCOL_VERSION:
+        raise ValueError(f"server responded with a response packet of version {response.version}; we only support version {CHRONY_PROTOCOL_VERSION}")
+    if response.reply != CHRONY_RESPONSE_TRACKING:
+        raise ValueError(f"response packet contains reply type {response.reply}; expected {CHRONY_RESPONSE_TRACKING} (tracking reply)")
     response_data = ReplyDataTracking.from_bytes(response.data_bytes)
 
     if args.stratum_crit is not None:

@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+#
+# Checks in which stratum a Chrony server sees itself.
+#
+# Maintainer: Ondřej Hošek <ondra.hosek@gmail.com>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+# uses Chrony protocol version 6
+#
+# packet format:
+# request {
+#     version: u8
+#     pkt_type: u8 [1 = request, 2 = reply]
+#     res1: u8
+#     res2: u8
+#     command: u16 [decides format of data]
+#     attempt: u16
+#     sequence: u32
+#     pad1: u32
+#     pad2: u32
+#     data: variable [depends on command]
+#     padding up to the maximum length of this command
+#         or the maximum length of its reply, whichever is greater
+# }
+#
+# reply {
+#     version: u8
+#     pkt_type: u8 [1 = request, 2 = reply]
+#     res1: u8
+#     res2: u8
+#     command: u16
+#     reply: u16 [decides format of data]
+#     status: u16
+#     pad1: u16
+#     pad2: u16
+#     pad3: u16
+#     sequence: u32
+#     pad4: u32
+#     pad5: u32
+#     data: variable [depends on reply]
+# }
+#
+# our request is REQ_TRACKING = 33, which carries no data
+# our reply is RPY_TRACKING = 5, which has the following reply structure:
+# reply_data_tracking {
+#     ref_id: u32
+#     ip_addr: ip_addr
+#     stratum: u16
+#     leap_status: u16
+#     ref_time: timespec
+#     current_correction: chrony_float
+#     last_offset: chrony_float
+#     rms_offset: chrony_float
+#     freq_ppm: chrony_float
+#     resid_freq_ppm: chrony_float
+#     skew_ppm: chrony_float
+#     root_delay: chrony_float
+#     root_dispersion: chrony_float
+#     last_update_interval: chrony_float
+# }
+#
+# ip_addr {
+#     union {
+#         in4: u32
+#         in6: u8[16]
+#         id: u32
+#     }
+#     family: u16
+#     pad: u16
+# }
+#
+# timespec {
+#     sec_high: u32
+#     sec_low: u32
+#     nsec: u32
+# }
+#
+# chrony_float {
+#     encoded_value: u32
+# }
+#
+# => request packet has unpadded length of 20
+#    response packet has unpadded length of 104
+
+import argparse
+import secrets
+import socket
+import struct
+import sys
+import traceback
+from typing import NamedTuple
+
+
+class Reply(NamedTuple):
+    version: int
+    pkt_type: int
+    command: int
+    reply: int
+    status: int
+    sequence: int
+    data_bytes: bytes
+
+    @staticmethod
+    def from_bytes(bs: bytes) -> 'Reply':
+        header_bytes = bs[:28]
+        if len(header_bytes) < 28:
+            raise ValueError("bs must be at least 28 bytes long")
+        data_bytes = bs[28:]
+
+        values = struct.unpack(">BBBBHHHHHHLLL", header_bytes)
+        return Reply(
+            version=values[0],
+            pkt_type=values[1],
+            # res1=values[2],
+            # res2=values[3],
+            command=values[4],
+            reply=values[5],
+            status=values[6],
+            # pad1=values[7],
+            # pad2=values[8],
+            # pad3=values[9],
+            sequence=values[10],
+            # pad4=values[11],
+            # pad5=values[12],
+            data_bytes=data_bytes,
+        )
+
+class IpAddr(NamedTuple):
+    address_bytes: bytes
+    family: int
+
+    @staticmethod
+    def from_bytes(bs: bytes) -> 'IpAddr':
+        values = struct.unpack(">16sHH", bs)
+        return IpAddr(
+            address_bytes=values[0],
+            family=values[1],
+            # pad=values[2],
+        )
+
+class TimeSpec(NamedTuple):
+    sec_high: int
+    sec_low: int
+    nsec: int
+
+    @staticmethod
+    def from_bytes(bs: bytes) -> 'TimeSpec':
+        values = struct.unpack(">LLL", bs)
+        return TimeSpec(
+            sec_high=values[0],
+            sec_low=values[1],
+            nsec=values[2],
+        )
+
+class ChronyFloat(NamedTuple):
+    u32_value: int
+
+    @staticmethod
+    def from_bytes(bs: bytes) -> 'ChronyFloat':
+        values = struct.unpack(">L", bs)
+        return ChronyFloat(
+            u32_value=values[0],
+        )
+
+class ReplyDataTracking(NamedTuple):
+    ref_id: int
+    ip_addr: IpAddr
+    stratum: int
+    leap_status: int
+    ref_time: TimeSpec
+    current_correction: ChronyFloat
+    last_offset: ChronyFloat
+    rms_offset: ChronyFloat
+    freq_ppm: ChronyFloat
+    resid_freq_ppm: ChronyFloat
+    skew_ppm: ChronyFloat
+    root_delay: ChronyFloat
+    root_dispersion: ChronyFloat
+    last_update_interval: ChronyFloat
+
+    @staticmethod
+    def from_bytes(bs: bytes) -> 'ReplyDataTracking':
+        values = struct.unpack(">L20sHH12s4s4s4s4s4s4s4s4s4s", bs)
+        return ReplyDataTracking(
+            ref_id=values[0],
+            ip_addr=IpAddr.from_bytes(values[1]),
+            stratum=values[2],
+            leap_status=values[3],
+            ref_time=TimeSpec.from_bytes(values[4]),
+            current_correction=ChronyFloat.from_bytes(values[5]),
+            last_offset=ChronyFloat.from_bytes(values[6]),
+            rms_offset=ChronyFloat.from_bytes(values[7]),
+            freq_ppm=ChronyFloat.from_bytes(values[8]),
+            resid_freq_ppm=ChronyFloat.from_bytes(values[9]),
+            skew_ppm=ChronyFloat.from_bytes(values[10]),
+            root_delay=ChronyFloat.from_bytes(values[11]),
+            root_dispersion=ChronyFloat.from_bytes(values[12]),
+            last_update_interval=ChronyFloat.from_bytes(values[13]),
+        )
+
+
+CHRONY_PROTOCOL_VERSION = 6
+CHRONY_PKT_TYPE_REQUEST = 1
+CHRONY_PKT_TYPE_REPLY = 2
+CHRONY_REQUEST_TRACKING = 33
+CHRONY_RESPONSE_TRACKING = 5
+
+EXIT_OK = 0
+EXIT_WARN = 1
+EXIT_CRIT = 2
+EXIT_UNKNOWN = 3
+
+
+def make_tracking_request_packet(sequence: int, attempt: int) -> bytes:
+    send_data_buf = bytearray(104)
+    struct.pack_into(
+        ">BBBBHHLLL", send_data_buf, 0,
+        CHRONY_PROTOCOL_VERSION,
+        CHRONY_PKT_TYPE_REQUEST,
+        0,
+        0,
+        CHRONY_REQUEST_TRACKING,
+        attempt,
+        sequence,
+        0,
+        0,
+    )
+    return bytes(send_data_buf)
+
+
+def query_chrony(hostname: str, port: int) -> Reply:
+    # find addresses
+    socket_addresses = socket.getaddrinfo(
+        hostname,
+        port,
+        type=socket.SOCK_DGRAM,
+        proto=socket.IPPROTO_UDP,
+    )
+
+    # query chrony
+    last_timeout = None
+    for sock_family, sock_type, sock_proto, _canon_name, sock_addr in socket_addresses:
+        # make a relevant socket
+        sock = socket.socket(sock_family, sock_type, sock_proto)
+        sock.settimeout(5.0)
+        sock.connect(sock_addr)
+
+        # generate a random u32 sequence number
+        sequence = secrets.randbits(32)
+
+        for attempt in range(0, 5):
+            # generate the request packet
+            req_packet = make_tracking_request_packet(sequence, attempt)
+
+            # send it
+            sock.send(req_packet)
+
+            # receive a response
+            try:
+                response = sock.recv(1024)
+            except socket.timeout as timeout:
+                last_timeout = timeout
+                continue
+
+            # return the decoded response
+            sock.close()
+            return Reply.from_bytes(response)
+
+        sock.close()
+
+    # nothing worked; raise the last timeout
+    raise last_timeout
+
+
+def run():
+    parser = argparse.ArgumentParser(
+        description="Checks the stratum of the remote chrony server.",
+    )
+    parser.add_argument(
+        "-H", "--hostname",
+        dest="hostname", required=True,
+        help="The host on which chrony is running.",
+    )
+    parser.add_argument(
+        "-p", "--port",
+        dest="port", type=int, default=323,
+        help="The port number using which to contact chrony.",
+    )
+    parser.add_argument(
+        "-W", "--swarn",
+        dest="stratum_warn", type=int, default=None,
+        help="The threshold value for the stratum above which to return a warning.",
+    )
+    parser.add_argument(
+        "-C", "--scrit",
+        dest="stratum_crit", type=int, default=None,
+        help="The threshold value for the stratum above which to return a critical state.",
+    )
+    args = parser.parse_args()
+
+    response = query_chrony(args.hostname, args.port)
+    response_data = ReplyDataTracking.from_bytes(response.data_bytes)
+
+    if args.stratum_crit is not None:
+        if response_data.stratum >= args.stratum_crit:
+            print(f"CRITICAL: {args.hostname}:{args.port} reported stratum {response_data.stratum} is >= {args.stratum_crit}")
+            sys.exit(EXIT_CRIT)
+    if args.stratum_warn is not None:
+        if response_data.stratum >= args.stratum_warn:
+            print(f"WARNING: {args.hostname}:{args.port} reported stratum {response_data.stratum} is >= {args.stratum_warn}")
+            sys.exit(EXIT_WARN)
+
+    print(f"OK: {args.hostname}:{args.port} reported stratum is {response_data.stratum}")
+    sys.exit(EXIT_OK)
+
+
+def main():
+    try:
+        run()
+    except SystemExit:
+        raise
+    except:
+        traceback.print_exc()
+
+        # exit with UNKNOWN
+        sys.exit(EXIT_UNKNOWN)
+
+
+if __name__ == "__main__":
+    main()

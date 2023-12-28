@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+#
+# Checks a few properties of a Chrony server's peers:
+# * time offset between Chrony server and its chosen peer
+# * jitter (standard deviation) between the Chrony server and its chosen peer
+# * stratum of the chosen peer as seen by Chrony
+# * general number of usable peers ("true chimers")
+#
+# Maintainer: Ondřej Hošek <ondra.hosek@gmail.com>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+# uses Chrony protocol version 6
+#
+# packet format:
+# request {
+#     version: u8
+#     pkt_type: u8 [1 = request, 2 = reply]
+#     res1: u8
+#     res2: u8
+#     command: u16 [decides format of data]
+#     attempt: u16
+#     sequence: u32
+#     pad1: u32
+#     pad2: u32
+#     data: variable [depends on command]
+#     padding up to the maximum length of this command
+#         or the maximum length of its reply, whichever is greater
+# } [fixed_length=20]
+#
+# reply {
+#     version: u8
+#     pkt_type: u8 [1 = request, 2 = reply]
+#     res1: u8
+#     res2: u8
+#     command: u16
+#     reply: u16 [decides format of data]
+#     status: u16
+#     pad1: u16
+#     pad2: u16
+#     pad3: u16
+#     sequence: u32
+#     pad4: u32
+#     pad5: u32
+#     data: variable [depends on reply]
+# } [fixed_length=28]
+#
+# our requests are:
+# 1. REQ_NULL = 0, which carries no data
+# 2. REQ_N_SOURCES = 14, which carries no data
+# 3. REQ_SOURCE_DATA = 15, which carries { index: i32 } [length=4] as data
+# 4. REQ_SOURCESTATS = 34, which carries { index: i32 } [length=4] as data
+#
+# our replies are, respectively:
+# 1. RPY_NULL = 1, which carries no data
+# 2. RPY_N_SOURCES = 2, which carries { number_of_sources: u32 } [length=4] as data
+# 3. RPY_SOURCE_DATA = 3, which carries reply_data_source as data (see below)
+# 4. RPY_SOURCESTATS = 6, which carries reply_data_source_stats as data (see below)
+#
+# reply_data_source {
+#     ip_addr: ip_addr
+#     poll: i16
+#     stratum: u16
+#     state: u16
+#     mode: u16
+#     flags: u16
+#     reachability: u16
+#     since_sample: u32
+#     orig_latest_meas: chrony_float
+#     latest_meas: chrony_float
+#     latest_meas_err: chrony_float
+# } [length=48]
+#
+# reply_data_source_stats {
+#     ref_id: u32
+#     ip_addr: ip_addr
+#     n_samples: u32
+#     n_runs: u32
+#     span_seconds: u32
+#     standard_deviation: chrony_float
+#     resid_freq_ppm: chrony_float
+#     skew_ppm: chrony_float
+#     est_offset: chrony_float
+#     est_offset_err: chrony_float
+# } [length=56]
+#
+# ip_addr {
+#     union {
+#         in4: u32
+#         in6: u8[16]
+#         id: u32
+#     }
+#     family: u16
+#     pad: u16
+# } [length=20]
+#
+# chrony_float {
+#     encoded_value: u32
+# } [length=4]
+
+import argparse
+import ipaddress
+import math
+import secrets
+import socket
+import struct
+import sys
+import traceback
+from typing import Any, Callable, List, NamedTuple, Optional, Tuple, Union
+
+
+class Reply(NamedTuple):
+    version: int
+    pkt_type: int
+    command: int
+    reply: int
+    status: int
+    sequence: int
+    data_bytes: bytes
+
+    @staticmethod
+    def from_bytes(bs: bytes) -> 'Reply':
+        header_bytes = bs[:28]
+        if len(header_bytes) < 28:
+            raise ValueError("bs must be at least 28 bytes long")
+        data_bytes = bs[28:]
+
+        values = struct.unpack(">BBBBHHHHHHLLL", header_bytes)
+        return Reply(
+            version=values[0],
+            pkt_type=values[1],
+            # res1=values[2],
+            # res2=values[3],
+            command=values[4],
+            reply=values[5],
+            status=values[6],
+            # pad1=values[7],
+            # pad2=values[8],
+            # pad3=values[9],
+            sequence=values[10],
+            # pad4=values[11],
+            # pad5=values[12],
+            data_bytes=data_bytes,
+        )
+
+class IpAddr(NamedTuple):
+    address_bytes: bytes
+    family: int
+
+    @staticmethod
+    def from_bytes(bs: bytes) -> 'IpAddr':
+        values = struct.unpack(">16sHH", bs)
+        return IpAddr(
+            address_bytes=values[0],
+            family=values[1],
+            # pad=values[2],
+        )
+
+    def to_ip_address(self) -> Union[ipaddress.IPv4Address, ipaddress.IPv6Address, None]:
+        if self.family == 1:
+            # inet4
+            return ipaddress.IPv4Address(self.address_bytes[0:4])
+        elif self.family == 2:
+            # inet6
+            return ipaddress.IPv6Address(self.address_bytes[0:16])
+        else:
+            return None
+
+class ChronyFloat(NamedTuple):
+    u32_value: int
+
+    @staticmethod
+    def from_bytes(bs: bytes) -> 'ChronyFloat':
+        values = struct.unpack(">L", bs)
+        return ChronyFloat(
+            u32_value=values[0],
+        )
+
+    def to_float(self) -> float:
+        FLOAT_EXP_BITS = 7
+        FLOAT_COEF_BITS = (4 * 8) - FLOAT_EXP_BITS
+
+        exp = self.u32_value >> FLOAT_COEF_BITS
+        if exp >= (1 << (FLOAT_EXP_BITS - 1)):
+            exp -= (1 << FLOAT_EXP_BITS)
+        exp -= FLOAT_COEF_BITS
+
+        coef = self.u32_value % (1 << FLOAT_COEF_BITS)
+        if coef >= (1 << (FLOAT_COEF_BITS - 1)):
+            coef -= (1 << FLOAT_COEF_BITS)
+
+        return coef * math.pow(2.0, exp)
+
+class ReplyDataSource(NamedTuple):
+    ip_addr: IpAddr
+    poll: int
+    stratum: int
+    state: int
+    mode: int
+    flags: int
+    reachability: int
+    since_sample: int
+    orig_latest_meas: ChronyFloat
+    latest_meas: ChronyFloat
+    latest_meas_err: ChronyFloat
+
+    @staticmethod
+    def from_bytes(bs: bytes) -> 'ReplyDataSource':
+        values = struct.unpack(">20shHHHHHL4s4s4s", bs)
+        return ReplyDataSource(
+            ip_addr=IpAddr.from_bytes(values[0]),
+            poll=values[1],
+            stratum=values[2],
+            state=values[3],
+            mode=values[4],
+            flags=values[5],
+            reachability=values[6],
+            since_sample=values[7],
+            orig_latest_meas=ChronyFloat.from_bytes(values[8]),
+            latest_meas=ChronyFloat.from_bytes(values[9]),
+            latest_meas_err=ChronyFloat.from_bytes(values[10]),
+        )
+
+class ReplyDataSourceStats(NamedTuple):
+    ref_id: int
+    ip_addr: IpAddr
+    n_samples: int
+    n_runs: int
+    span_seconds: int
+    standard_deviation: ChronyFloat
+    resid_freq_ppm: ChronyFloat
+    skew_ppm: ChronyFloat
+    est_offset: ChronyFloat
+    est_offset_err: ChronyFloat
+
+    @staticmethod
+    def from_bytes(bs: bytes) -> 'ReplyDataSourceStats':
+        values = struct.unpack(">L20sLLL4s4s4s4s4s", bs)
+        return ReplyDataSourceStats(
+            ref_id=values[0],
+            ip_addr=IpAddr.from_bytes(values[1]),
+            n_samples=values[2],
+            n_runs=values[3],
+            span_seconds=values[4],
+            standard_deviation=ChronyFloat.from_bytes(values[5]),
+            resid_freq_ppm=ChronyFloat.from_bytes(values[6]),
+            skew_ppm=ChronyFloat.from_bytes(values[7]),
+            est_offset=ChronyFloat.from_bytes(values[8]),
+            est_offset_err=ChronyFloat.from_bytes(values[9]),
+        )
+
+
+class ValueRange(NamedTuple):
+    minimum: Optional[float]
+    maximum: Optional[float]
+
+    def contains_value(self, value: Union[int, float]) -> bool:
+        # minimum and maximum are inclusive (Nagios plugin compatibility)
+        if self.minimum is not None:
+            if value < self.minimum:
+                return False
+        if self.maximum is not None:
+            if self.maximum < value:
+                return False
+        return True
+
+    @staticmethod
+    def from_string(s: str) -> 'ValueRange':
+        pieces = s.split(":")
+        if len(pieces) != 2:
+            raise ValueError(f"specified range {s} does not contain exactly one ':' character")
+        minimum = float(pieces[0]) if pieces[0] else None
+        maximum = float(pieces[1]) if pieces[1] else None
+        return ValueRange(minimum, maximum)
+
+    def __str__(self) -> str:
+        return f"[{self.minimum}, {self.maximum}]"
+
+
+class ChronyConnection:
+    def __init__(self, hostname: str, port: int) -> None:
+        last_timeout = None
+
+        # find working chrony server
+        socket_addresses = socket.getaddrinfo(
+            hostname,
+            port,
+            type=socket.SOCK_DGRAM,
+            proto=socket.IPPROTO_UDP,
+        )
+        for sock_family, sock_type, sock_proto, _canon_name, sock_addr in socket_addresses:
+            # make a relevant socket
+            sock = socket.socket(sock_family, sock_type, sock_proto)
+            sock.settimeout(5.0)
+            sock.connect(sock_addr)
+
+            # generate a random u32 sequence number
+            self.sequence = secrets.randbits(32)
+
+            for attempt in range(0, 5):
+                # generate the request packet
+                req_packet = make_null_request_packet(self.sequence, attempt)
+
+                # send it
+                sock.send(req_packet)
+
+                # receive a response
+                try:
+                    response = sock.recv(1024)
+                except socket.timeout as timeout:
+                    last_timeout = timeout
+                    continue
+
+                # check the decoded reply
+                reply = Reply.from_bytes(response)
+                if reply.version != CHRONY_PROTOCOL_VERSION:
+                    raise ValueError(f"server responded with a response packet of version {reply.version}; we only support version {CHRONY_PROTOCOL_VERSION}")
+                if reply.reply != CHRONY_RESPONSE_NULL:
+                    raise ValueError(f"response packet contains reply type {reply.reply}; expected {CHRONY_RESPONSE_NULL} (null reply)")
+                if len(reply.data_bytes) != 0:
+                    raise ValueError(f"response packet contains {len(reply.data_bytes)} bytes of data; expected 0 data bytes")
+
+                # perfect, store the socket for future calls
+                self.sock = sock
+                self.sequence = (self.sequence + 1) & 0xFFFFFFFF
+                return
+
+            # none of these worked; close down the socket
+            sock.close()
+
+        # no functioning server found
+        # re-raise the last caught timeout exception
+        raise last_timeout
+
+    def communicate(self, make_request_packet: Callable[[int, int], bytes]) -> Reply:
+        last_timeout = None
+        for attempt in range(0, 5):
+            # generate the request packet
+            req_packet = make_request_packet(self.sequence, attempt)
+
+            # send it
+            self.sock.send(req_packet)
+
+            # receive a response
+            try:
+                response = self.sock.recv(1024)
+            except socket.timeout as timeout:
+                last_timeout = timeout
+                continue
+
+            # decode and return the reply
+            reply = Reply.from_bytes(response)
+            if reply.version != CHRONY_PROTOCOL_VERSION:
+                raise ValueError(f"server responded with a response packet of version {reply.version}; we only support version {CHRONY_PROTOCOL_VERSION}")
+            self.sequence = (self.sequence + 1) & 0xFFFFFFFF
+            return reply
+
+        # none of the attempts were successful
+        # re-raise the last timeout we caught
+        raise last_timeout
+
+
+CHRONY_PROTOCOL_VERSION = 6
+CHRONY_PKT_TYPE_REQUEST = 1
+CHRONY_PKT_TYPE_REPLY = 2
+CHRONY_REQUEST_NULL = 0
+CHRONY_REQUEST_N_SOURCES = 14
+CHRONY_REQUEST_SOURCE_DATA = 15
+CHRONY_REQUEST_SOURCE_STATS = 34
+CHRONY_RESPONSE_NULL = 1
+CHRONY_RESPONSE_N_SOURCES = 2
+CHRONY_RESPONSE_SOURCE_DATA = 3
+CHRONY_RESPONSE_SOURCE_STATS = 6
+CHRONY_SOURCE_STATE_SELECTED = 0
+CHRONY_SOURCE_STATE_NONSELECTABLE = 1
+CHRONY_SOURCE_STATE_FALSETICKER = 2
+CHRONY_SOURCE_STATE_JITTERY = 3
+CHRONY_SOURCE_STATE_UNSELECTED = 4
+CHRONY_SOURCE_STATE_SELECTABLE = 5
+
+EXIT_OK = 0
+EXIT_WARN = 1
+EXIT_CRIT = 2
+EXIT_UNKNOWN = 3
+
+
+def make_null_request_packet(sequence: int, attempt: int) -> bytes:
+    # padded to full reply length (28 fixed reply bytes, 0 data bytes)
+    send_data_buf = bytearray(28 + 0)
+    struct.pack_into(
+        ">BBBBHHLLL", send_data_buf, 0,
+        CHRONY_PROTOCOL_VERSION,
+        CHRONY_PKT_TYPE_REQUEST,
+        0,
+        0,
+        CHRONY_REQUEST_NULL,
+        attempt,
+        sequence,
+        0,
+        0,
+    )
+    return bytes(send_data_buf)
+
+
+def make_n_sources_request_packet(sequence: int, attempt: int) -> bytes:
+    # padded to full reply length (28 fixed reply bytes, 4 data bytes)
+    send_data_buf = bytearray(28 + 4)
+    struct.pack_into(
+        ">BBBBHHLLL", send_data_buf, 0,
+        CHRONY_PROTOCOL_VERSION,
+        CHRONY_PKT_TYPE_REQUEST,
+        0,
+        0,
+        CHRONY_REQUEST_N_SOURCES,
+        attempt,
+        sequence,
+        0,
+        0,
+    )
+    return bytes(send_data_buf)
+
+
+def make_source_data_request_packet(sequence: int, attempt: int, source_index: int) -> bytes:
+    # padded to full reply length (28 fixed reply bytes, 48 data bytes)
+    send_data_buf = bytearray(28 + 48)
+    struct.pack_into(
+        ">BBBBHHLLLl", send_data_buf, 0,
+        CHRONY_PROTOCOL_VERSION,
+        CHRONY_PKT_TYPE_REQUEST,
+        0,
+        0,
+        CHRONY_REQUEST_SOURCE_DATA,
+        attempt,
+        sequence,
+        0,
+        0,
+        source_index,
+    )
+    return bytes(send_data_buf)
+
+
+def make_source_stats_request_packet(sequence: int, attempt: int, source_index: int) -> bytes:
+    # padded to full reply length (28 fixed reply bytes, 56 data bytes)
+    send_data_buf = bytearray(28 + 56)
+    struct.pack_into(
+        ">BBBBHHLLLl", send_data_buf, 0,
+        CHRONY_PROTOCOL_VERSION,
+        CHRONY_PKT_TYPE_REQUEST,
+        0,
+        0,
+        CHRONY_REQUEST_SOURCE_STATS,
+        attempt,
+        sequence,
+        0,
+        0,
+        source_index,
+    )
+    return bytes(send_data_buf)
+
+
+def resolve_server(hostname: str, port: int) -> List[Tuple[Any, ...]]:
+    return socket.getaddrinfo(
+        hostname,
+        port,
+        type=socket.SOCK_DGRAM,
+        proto=socket.IPPROTO_UDP,
+    )
+
+
+def run():
+    parser = argparse.ArgumentParser(
+        description="Checks the stratum of the remote chrony server.",
+    )
+    parser.add_argument(
+        "-H", "--hostname",
+        dest="hostname", required=True,
+        help="The host on which chrony is running.",
+    )
+    parser.add_argument(
+        "-p", "--port",
+        dest="port", type=int, default=323,
+        help="The port number using which to contact chrony.",
+    )
+    parser.add_argument(
+        "-c", "--ocrit",
+        dest="offset_secs_crit", type=ValueRange.from_string, default=ValueRange(0.0, 60.0),
+        help="The threshold values for the absolute value of the time offset between chrony's and the chosen peer's time (in seconds) outside of which to return a critical state.",
+    )
+    parser.add_argument(
+        "-w", "--owarn",
+        dest="offset_secs_warn", type=ValueRange.from_string, default=ValueRange(0.0, 120.0),
+        help="The threshold values for the absolute value of the time offset between chrony's and the chosen peer's time (in seconds) outside of which to return a warning.",
+    )
+    parser.add_argument(
+        "-k", "--jcrit",
+        dest="jitter_crit", type=ValueRange.from_string, default=None,
+        help="The threshold values for the jitter (standard deviation) between chrony and the chosen peer outside of which to return a critical state.",
+    )
+    parser.add_argument(
+        "-j", "--jwarn",
+        dest="jitter_warn", type=ValueRange.from_string, default=None,
+        help="The threshold values for the jitter (standard deviation) between chrony and the chosen peer outside of which to return a warning.",
+    )
+    parser.add_argument(
+        "-C", "--scrit",
+        dest="stratum_crit", type=ValueRange.from_string, default=None,
+        help="The threshold values for the chosen peer's stratum outside of which to return a critical state.",
+    )
+    parser.add_argument(
+        "-W", "--swarn",
+        dest="stratum_warn", type=ValueRange.from_string, default=None,
+        help="The threshold values for the chosen peer's stratum outside of which to return a warning state.",
+    )
+    parser.add_argument(
+        "-n", "--tcrit",
+        dest="truechimers_crit", type=ValueRange.from_string, default=None,
+        help="The threshold values for the number of truechimers (peers trustworthy enough to be chosen) outside of which to return a critical state.",
+    )
+    parser.add_argument(
+        "-m", "--twarn",
+        dest="truechimers_warn", type=ValueRange.from_string, default=None,
+        help="The threshold values for the number of truechimers (peers trustworthy enough to be chosen) outside of which to return a warning state.",
+    )
+    args = parser.parse_args()
+
+    # make a connection to Chrony
+    chrony = ChronyConnection(args.hostname, args.port)
+
+    # query number of sources
+    num_sources_reply = chrony.communicate(make_n_sources_request_packet)
+    if num_sources_reply.reply != CHRONY_RESPONSE_N_SOURCES:
+        raise ValueError(f"response packet contains reply type {num_sources_reply.reply}; expected {CHRONY_RESPONSE_N_SOURCES} (number-of-sources reply)")
+    (num_sources,) = struct.unpack(">L", num_sources_reply.data_bytes)
+
+    # obtain each source
+    replies: List[Tuple[ReplyDataSource, ReplyDataSourceStats]] = []
+    for i in range(num_sources):
+        # query source data
+        source_data_reply = chrony.communicate(lambda seq, att: make_source_data_request_packet(seq, att, i))
+        if source_data_reply.reply != CHRONY_RESPONSE_SOURCE_DATA:
+            raise ValueError(f"response packet contains reply type {source_data_reply.reply}; expected {CHRONY_RESPONSE_SOURCE_DATA} (source-data reply)")
+        source_data = ReplyDataSource.from_bytes(source_data_reply.data_bytes)
+
+        # query source stats
+        source_stats_reply = chrony.communicate(lambda seq, att: make_source_stats_request_packet(seq, att, i))
+        if source_stats_reply.reply != CHRONY_RESPONSE_SOURCE_STATS:
+            raise ValueError(f"response packet contains reply type {source_stats_reply.reply}; expected {CHRONY_RESPONSE_SOURCE_STATS} (source-stats reply)")
+        source_stats = ReplyDataSourceStats.from_bytes(source_stats_reply.data_bytes)
+
+        replies.append((source_data, source_stats))
+
+    # find the selected source
+    chosen_index = None
+    for i, (source_data, source_stats) in enumerate(replies):
+        if source_data.state == CHRONY_SOURCE_STATE_SELECTED:
+            chosen_index = i
+    if chosen_index is None:
+        print(f"CRITICAL: {args.hostname}:{args.port} reports no source selected")
+        sys.exit(EXIT_CRIT)
+    (chosen_data, chosen_stats) = replies[chosen_index]
+    peer_addr = chosen_data.ip_addr.to_ip_address()
+    offset = chosen_data.latest_meas.to_float()
+    jitter = chosen_stats.standard_deviation.to_float()
+    stratum = chosen_data.stratum
+    number_truechimers = sum(
+        1
+        for (data, _stats) in replies
+        if data.state in (CHRONY_SOURCE_STATE_SELECTED, CHRONY_SOURCE_STATE_UNSELECTED, CHRONY_SOURCE_STATE_SELECTABLE)
+    )
+
+    worst_status = 0
+    status_line = f"{args.hostname}:{args.port} chosen peer {peer_addr}"
+    checks = (
+        (abs(offset), offset, args.offset_secs_crit, args.offset_secs_warn, "offset", "s", ":.8f"),
+        (jitter, jitter, args.jitter_crit, args.jitter_warn, "jitter", "", ""),
+        (stratum, stratum, args.stratum_crit, args.stratum_warn, "stratum", "", ""),
+        (number_truechimers, number_truechimers, args.truechimers_crit, args.truechimers_warn, "truechimers", "", ""),
+    )
+    for (check_value, output_value, crit_range, warn_range, descriptor, value_suffix, format_spec) in checks:
+        formatted = ("{" + format_spec + "}").format(output_value)
+        status_line += f", {descriptor}={formatted}{value_suffix}"
+        if crit_range is not None:
+            if not crit_range.contains_value(check_value):
+                status_line += " (CRIT)"
+                if worst_status < EXIT_CRIT:
+                    worst_status = EXIT_CRIT
+        if warn_range is not None:
+            if not warn_range.contains_value(check_value):
+                status_line += " (WARN)"
+                if worst_status < EXIT_WARN:
+                    worst_status = EXIT_WARN
+
+    # output performance data
+    status_line += f"|offset={abs(offset):.8f} jitter={jitter:.8f} stratum={stratum} truechimers={number_truechimers}"
+    if worst_status == 0:
+        status_line = "OK " + status_line
+    elif worst_status == 1:
+        status_line = "WARNING " + status_line
+    elif worst_status == 2:
+        status_line = "CRITICAL " + status_line
+    elif worst_status == 3:
+        status_line = "UNKNOWN " + status_line
+    print(status_line)
+    sys.exit(worst_status)
+
+
+def main():
+    try:
+        run()
+    except SystemExit:
+        raise
+    except:
+        traceback.print_exc()
+
+        # exit with UNKNOWN
+        sys.exit(EXIT_UNKNOWN)
+
+
+if __name__ == "__main__":
+    main()

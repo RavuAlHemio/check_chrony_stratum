@@ -279,13 +279,22 @@ class ValueRange(NamedTuple):
 
 
 class ChronyConnection:
-    def __init__(self, hostname: str, port: int) -> None:
+    def __init__(self, hostname: str, port: int, ipv4: bool, ipv6: bool) -> None:
         last_timeout = None
+
+        if (ipv4 and ipv6) or (not ipv4 and not ipv6):
+            family = socket.AF_UNSPEC
+        elif ipv4:
+            family = socket.AF_INET
+        else:
+            assert ipv6
+            family = socket.AF_INET6
 
         # find working chrony server
         socket_addresses = socket.getaddrinfo(
             hostname,
             port,
+            family=family,
             type=socket.SOCK_DGRAM,
             proto=socket.IPPROTO_UDP,
         )
@@ -522,10 +531,20 @@ def run():
         dest="truechimers_warn", type=ValueRange.from_string, default=None,
         help="The threshold values for the number of truechimers (peers trustworthy enough to be chosen) outside of which to return a warning state.",
     )
+    parser.add_argument(
+        "-4", "--ipv4",
+        dest="ipv4", action="store_true",
+        help="Use IPv4 for communication. By default, both IPv4 and IPv6 are attempted.",
+    )
+    parser.add_argument(
+        "-6", "--ipv6",
+        dest="ipv6", action="store_true",
+        help="Use IPv6 for communication. By default, both IPv4 and IPv6 are attempted.",
+    )
     args = parser.parse_args()
 
     # make a connection to Chrony
-    chrony = ChronyConnection(args.hostname, args.port)
+    chrony = ChronyConnection(args.hostname, args.port, args.ipv4, args.ipv6)
 
     # query number of sources
     num_sources_reply = chrony.communicate(make_n_sources_request_packet)

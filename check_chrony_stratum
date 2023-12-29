@@ -230,11 +230,20 @@ def make_tracking_request_packet(sequence: int, attempt: int) -> bytes:
     return bytes(send_data_buf)
 
 
-def query_chrony(hostname: str, port: int) -> Reply:
+def query_chrony(hostname: str, port: int, ipv4: bool, ipv6: bool) -> Reply:
+    if (ipv4 and ipv6) or (not ipv4 and not ipv6):
+        family = socket.AF_UNSPEC
+    elif ipv4:
+        family = socket.AF_INET
+    else:
+        assert ipv6
+        family = socket.AF_INET6
+
     # find addresses
     socket_addresses = socket.getaddrinfo(
         hostname,
         port,
+        family=family,
         type=socket.SOCK_DGRAM,
         proto=socket.IPPROTO_UDP,
     )
@@ -298,9 +307,19 @@ def run():
         dest="stratum_crit", type=int, default=None,
         help="The threshold value for the stratum above which to return a critical state.",
     )
+    parser.add_argument(
+        "-4", "--ipv4",
+        dest="ipv4", action="store_true",
+        help="Use IPv4 for communication. By default, both IPv4 and IPv6 are attempted.",
+    )
+    parser.add_argument(
+        "-6", "--ipv6",
+        dest="ipv6", action="store_true",
+        help="Use IPv6 for communication. By default, both IPv4 and IPv6 are attempted.",
+    )
     args = parser.parse_args()
 
-    response = query_chrony(args.hostname, args.port)
+    response = query_chrony(args.hostname, args.port, args.ipv4, args.ipv6)
     if response.version != CHRONY_PROTOCOL_VERSION:
         raise ValueError(f"server responded with a response packet of version {response.version}; we only support version {CHRONY_PROTOCOL_VERSION}")
     if response.reply != CHRONY_RESPONSE_TRACKING:

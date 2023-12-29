@@ -7,6 +7,7 @@
 # * general number of usable peers ("true chimers")
 #
 # Maintainer: Ondřej Hošek <ondra.hosek@gmail.com>
+# Repository: https://github.com/RavuAlHemio/check_chrony_stratum
 #
 # SPDX-License-Identifier: CC0-1.0
 
